@@ -48,6 +48,8 @@ mod async_imports {
 	pub use futures::future::{Either, ok};
 	pub use futures::Stream as FutureStream;
 	pub use futures::{Future, IntoFuture, Sink};
+	pub use rand::thread_rng;
+	pub use rand::prelude::IteratorRandom;
 	pub use tokio::codec::FramedParts;
 	pub use tokio::codec::{Decoder, Framed};
 	pub use tokio::net::TcpStream as TcpStreamNew;
@@ -858,7 +860,7 @@ impl<'u> ClientBuilder<'u> {
 									WSUrlErrorKind::NoHostName,
 								))
 								.and_then(move |addrs| {
-									match addrs.into_iter().next() {
+									match addrs.into_iter().choose(&mut thread_rng()) {
 										Some(a) => Ok(a),
 										None => {
 											Err(WebSocketError::WebSocketUrlError(
