@@ -45,6 +45,7 @@ mod async_imports {
 	pub use super::super::async;
 	pub use codec::ws::{Context, MessageCodec};
 	pub use futures::future;
+	pub use futures::future::{Either, ok};
 	pub use futures::Stream as FutureStream;
 	pub use futures::{Future, IntoFuture, Sink};
 	pub use tokio::codec::FramedParts;
@@ -54,6 +55,7 @@ mod async_imports {
 	#[cfg(feature = "async-ssl")]
 	pub use tokio_tls::TlsConnector as TlsConnectorExt;
 	pub use ws::util::update_framed_codec;
+	pub use std::net::{SocketAddr, IpAddr};
 }
 #[cfg(feature = "async")]
 use self::async_imports::*;
@@ -836,28 +838,46 @@ impl<'u> ClientBuilder<'u> {
 	fn async_tcpstream(
 		&self,
 		secure: Option<bool>,
-	) -> Box<future::Future<Item = TcpStreamNew, Error = WebSocketError> + Send> {
-		// get the address to connect to, return an error future if ther's a problem
-		let address = match self
-			.extract_host_port(secure)
-			.and_then(|p| Ok(p.to_socket_addrs()?))
-		{
-			Ok(mut s) => match s.next() {
-				Some(a) => a,
-				None => {
-					return Box::new(
-						Err(WebSocketError::WebSocketUrlError(
-							WSUrlErrorKind::NoHostName,
-						))
-						.into_future(),
-					);
-				}
-			},
-			Err(e) => return Box::new(Err(e).into_future()),
-		};
+	) -> impl future::Future<Item = TcpStreamNew, Error = WebSocketError> + Send {
+		let resolver = self.resolver.clone();
 
-		// connect a tcp stream
-		Box::new(TcpStreamNew::connect(&address).map_err(Into::into))
+		self
+			.extract_host_port(secure)
+			.map(|r| r.to_owned())
+			.into_future()
+			.and_then(move |p| {
+
+				let port = p.port;
+
+				let resolve = match p.host {
+					url::Host::Domain(s) => {
+						Either::A(
+							resolver
+								.lookup_ip(&s[..])
+								.map_err(|e| WebSocketError::WebSocketUrlError(
+									WSUrlErrorKind::NoHostName,
+								))
+								.and_then(move |addrs| {
+									match addrs.into_iter().next() {
+										Some(a) => Ok(a),
+										None => {
+											Err(WebSocketError::WebSocketUrlError(
+												WSUrlErrorKind::NoHostName
+											))
+										}
+									}
+								})
+						)
+					},
+					url::Host::Ipv4(ip) => Either::B(ok(IpAddr::V4(ip))),
+					url::Host::Ipv6(ip) => Either::B(ok(IpAddr::V6(ip))),
+				};
+
+				resolve
+					.and_then(move |address| {
+						TcpStreamNew::connect(&SocketAddr::new(address, port)).map_err(Into::into)
+					})
+			})
 	}
 
 	#[cfg(any(feature = "sync", feature = "async"))]
