@@ -110,6 +110,8 @@ pub struct ClientBuilder<'u> {
 	headers: Headers,
 	version_set: bool,
 	key_set: bool,
+	#[cfg(feature = "async")]
+	resolver: trust_dns_resolver::AsyncResolver,
 }
 
 impl<'u> ClientBuilder<'u> {
@@ -128,6 +130,12 @@ impl<'u> ClientBuilder<'u> {
 	/// The path of a URL is optional if no port is given then port
 	/// 80 will be used in the case of `ws://` and port `443` will be
 	/// used in the case of `wss://`.
+	#[cfg(feature = "async")]
+	pub fn from_url(address: &'u Url, resolver: &trust_dns_resolver::AsyncResolver) -> Self {
+		ClientBuilder::init(Cow::Borrowed(address), resolver)
+	}
+
+	#[cfg(not(feature = "async"))]
 	pub fn from_url(address: &'u Url) -> Self {
 		ClientBuilder::init(Cow::Borrowed(address))
 	}
@@ -145,11 +153,31 @@ impl<'u> ClientBuilder<'u> {
 	/// let builder = ClientBuilder::new("wss://mycluster.club");
 	/// ```
 	#[cfg_attr(feature = "cargo-clippy", warn(new_ret_no_self))]
+	#[cfg(feature = "async")]
+	pub fn new(address: &str, resolver: &trust_dns_resolver::AsyncResolver) -> Result<Self, ParseError> {
+		let url = Url::parse(address)?;
+		Ok(ClientBuilder::init(Cow::Owned(url), resolver))
+	}
+
+	#[cfg(not(feature = "async"))]
 	pub fn new(address: &str) -> Result<Self, ParseError> {
 		let url = Url::parse(address)?;
 		Ok(ClientBuilder::init(Cow::Owned(url)))
 	}
 
+	#[cfg(feature = "async")]
+	fn init(url: Cow<'u, Url>, resolver: &trust_dns_resolver::AsyncResolver) -> Self {
+		ClientBuilder {
+			url,
+			version: HttpVersion::Http11,
+			version_set: false,
+			key_set: false,
+			headers: Headers::new(),
+			resolver: resolver.clone(),
+		}
+	}
+
+	#[cfg(not(feature = "async"))]
 	fn init(url: Cow<'u, Url>) -> Self {
 		ClientBuilder {
 			url,
@@ -544,12 +572,18 @@ impl<'u> ClientBuilder<'u> {
 		// connect to the tcp stream
 		let tcp_stream = self.async_tcpstream(None);
 
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
 		let builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver: resolver.clone(),
 		};
 
 		// check if we should connect over ssl or not
@@ -629,12 +663,18 @@ impl<'u> ClientBuilder<'u> {
 			}
 		};
 
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
 		let builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver,
 		};
 
 		// put it all together
@@ -680,12 +720,19 @@ impl<'u> ClientBuilder<'u> {
 	pub fn async_connect_insecure(self) -> async::ClientNew<async::TcpStream> {
 		let tcp_stream = self.async_tcpstream(Some(false));
 
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
+
 		let builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver
 		};
 
 		let future = tcp_stream.and_then(move |stream| builder.async_connect_on(stream));
@@ -740,12 +787,18 @@ impl<'u> ClientBuilder<'u> {
 	where
 		S: stream::async::Stream + Send + 'static,
 	{
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
 		let mut builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver,
 		};
 		let resource = builder.build_request();
 		let framed = ::codec::http::HttpClientCodec.framed(stream);
