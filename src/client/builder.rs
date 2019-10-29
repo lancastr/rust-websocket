@@ -45,15 +45,19 @@ mod async_imports {
 	pub use super::super::async;
 	pub use codec::ws::{Context, MessageCodec};
 	pub use futures::future;
+	pub use futures::future::{Either, ok};
 	pub use futures::Stream as FutureStream;
 	pub use futures::{Future, IntoFuture, Sink};
 	pub use tokio_codec::FramedParts;
 	pub use tokio_codec::{Decoder, Framed};
 	pub use tokio_reactor::Handle;
 	pub use tokio_tcp::TcpStream as TcpStreamNew;
+	pub use rand::thread_rng;
+	pub use rand::prelude::IteratorRandom;
 	#[cfg(feature = "async-ssl")]
 	pub use tokio_tls::TlsConnector as TlsConnectorExt;
 	pub use ws::util::update_framed_codec;
+	pub use std::net::{SocketAddr, IpAddr};
 }
 #[cfg(feature = "async")]
 use self::async_imports::*;
@@ -110,6 +114,8 @@ pub struct ClientBuilder<'u> {
 	headers: Headers,
 	version_set: bool,
 	key_set: bool,
+	#[cfg(feature = "async")]
+	resolver: trust_dns_resolver::AsyncResolver,
 }
 
 impl<'u> ClientBuilder<'u> {
@@ -128,6 +134,12 @@ impl<'u> ClientBuilder<'u> {
 	/// The path of a URL is optional if no port is given then port
 	/// 80 will be used in the case of `ws://` and port `443` will be
 	/// used in the case of `wss://`.
+	#[cfg(feature = "async")]
+	pub fn from_url(address: &'u Url, resolver: &trust_dns_resolver::AsyncResolver) -> Self {
+		ClientBuilder::init(Cow::Borrowed(address), resolver)
+	}
+
+	#[cfg(not(feature = "async"))]
 	pub fn from_url(address: &'u Url) -> Self {
 		ClientBuilder::init(Cow::Borrowed(address))
 	}
@@ -145,11 +157,31 @@ impl<'u> ClientBuilder<'u> {
 	/// let builder = ClientBuilder::new("wss://mycluster.club");
 	/// ```
 	#[cfg_attr(feature = "cargo-clippy", warn(new_ret_no_self))]
+	#[cfg(feature = "async")]
+	pub fn new(address: &str, resolver: &trust_dns_resolver::AsyncResolver) -> Result<Self, ParseError> {
+		let url = Url::parse(address)?;
+		Ok(ClientBuilder::init(Cow::Owned(url), resolver))
+	}
+
+	#[cfg(not(feature = "async"))]
 	pub fn new(address: &str) -> Result<Self, ParseError> {
 		let url = Url::parse(address)?;
 		Ok(ClientBuilder::init(Cow::Owned(url)))
 	}
 
+	#[cfg(feature = "async")]
+	fn init(url: Cow<'u, Url>, resolver: &trust_dns_resolver::AsyncResolver) -> Self {
+		ClientBuilder {
+			url,
+			version: HttpVersion::Http11,
+			version_set: false,
+			key_set: false,
+			headers: Headers::new(),
+			resolver: resolver.clone(),
+		}
+	}
+
+	#[cfg(not(feature = "async"))]
 	fn init(url: Cow<'u, Url>) -> Self {
 		ClientBuilder {
 			url,
@@ -544,12 +576,18 @@ impl<'u> ClientBuilder<'u> {
 		// connect to the tcp stream
 		let tcp_stream = self.async_tcpstream(None);
 
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
 		let builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver: resolver.clone(),
 		};
 
 		// check if we should connect over ssl or not
@@ -629,12 +667,18 @@ impl<'u> ClientBuilder<'u> {
 			}
 		};
 
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
 		let builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver,
 		};
 
 		// put it all together
@@ -680,12 +724,19 @@ impl<'u> ClientBuilder<'u> {
 	pub fn async_connect_insecure(self) -> async::ClientNew<async::TcpStream> {
 		let tcp_stream = self.async_tcpstream(Some(false));
 
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
+
 		let builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver
 		};
 
 		let future = tcp_stream.and_then(move |stream| builder.async_connect_on(stream));
@@ -740,12 +791,18 @@ impl<'u> ClientBuilder<'u> {
 	where
 		S: stream::async::Stream + Send + 'static,
 	{
+		let (resolver, background) = trust_dns_resolver::AsyncResolver::new(
+			Default::default(),
+			Default::default(),
+		);
+
 		let mut builder = ClientBuilder {
 			url: Cow::Owned(self.url.into_owned()),
 			version: self.version,
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			resolver,
 		};
 		let resource = builder.build_request();
 		let framed = ::codec::http::HttpClientCodec.framed(stream);
@@ -783,28 +840,46 @@ impl<'u> ClientBuilder<'u> {
 	fn async_tcpstream(
 		&self,
 		secure: Option<bool>,
-	) -> Box<future::Future<Item = TcpStreamNew, Error = WebSocketError> + Send> {
-		// get the address to connect to, return an error future if ther's a problem
-		let address = match self
-			.extract_host_port(secure)
-			.and_then(|p| Ok(p.to_socket_addrs()?))
-		{
-			Ok(mut s) => match s.next() {
-				Some(a) => a,
-				None => {
-					return Box::new(
-						Err(WebSocketError::WebSocketUrlError(
-							WSUrlErrorKind::NoHostName,
-						))
-						.into_future(),
-					);
-				}
-			},
-			Err(e) => return Box::new(Err(e).into_future()),
-		};
+	) -> impl future::Future<Item = TcpStreamNew, Error = WebSocketError> + Send {
+		let resolver = self.resolver.clone();
 
-		// connect a tcp stream
-		Box::new(TcpStreamNew::connect(&address).map_err(Into::into))
+		self
+			.extract_host_port(secure)
+			.map(|r| r.to_owned())
+			.into_future()
+			.and_then(move |p| {
+
+				let port = p.port;
+
+				let resolve = match p.host {
+					url::Host::Domain(s) => {
+						Either::A(
+							resolver
+								.lookup_ip(&s[..])
+								.map_err(|e| WebSocketError::WebSocketUrlError(
+									WSUrlErrorKind::NoHostName,
+								))
+								.and_then(move |addrs| {
+									match addrs.into_iter().choose(&mut thread_rng()) {
+										Some(a) => Ok(a),
+										None => {
+											Err(WebSocketError::WebSocketUrlError(
+												WSUrlErrorKind::NoHostName
+											))
+										}
+									}
+								})
+						)
+					},
+					url::Host::Ipv4(ip) => Either::B(ok(IpAddr::V4(ip))),
+					url::Host::Ipv6(ip) => Either::B(ok(IpAddr::V6(ip))),
+				};
+
+				resolve
+					.and_then(move |address| {
+						TcpStreamNew::connect(&SocketAddr::new(address, port)).map_err(Into::into)
+					})
+			})
 	}
 
 	#[cfg(any(feature = "sync", feature = "async"))]

@@ -42,6 +42,8 @@ extern crate byteorder;
 extern crate bytes;
 #[cfg(feature = "async")]
 pub extern crate futures;
+#[cfg(feature = "async")]
+extern crate trust_dns_resolver;
 extern crate hyper;
 #[cfg(any(feature = "sync-ssl", feature = "async-ssl"))]
 extern crate native_tls;
