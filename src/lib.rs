@@ -62,6 +62,7 @@ extern crate tokio_tcp;
 #[cfg(feature = "async-ssl")]
 extern crate tokio_tls;
 extern crate unicase;
+extern crate net2;
 pub extern crate url;
 
 #[macro_use]

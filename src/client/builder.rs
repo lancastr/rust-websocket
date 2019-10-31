@@ -6,6 +6,7 @@ use hyper::header::{Authorization, Basic, Header, HeaderFormat, Headers};
 use hyper::version::HttpVersion;
 use std::borrow::Cow;
 use std::convert::Into;
+use net2::TcpBuilder;
 pub use url::{ParseError, Url};
 
 #[cfg(any(feature = "sync", feature = "async"))]
@@ -114,6 +115,7 @@ pub struct ClientBuilder<'u> {
 	headers: Headers,
 	version_set: bool,
 	key_set: bool,
+	bind_to: Option<SocketAddr>,
 	#[cfg(feature = "async")]
 	resolver: trust_dns_resolver::AsyncResolver,
 }
@@ -177,6 +179,7 @@ impl<'u> ClientBuilder<'u> {
 			version_set: false,
 			key_set: false,
 			headers: Headers::new(),
+			bind_to: None,
 			resolver: resolver.clone(),
 		}
 	}
@@ -189,6 +192,7 @@ impl<'u> ClientBuilder<'u> {
 			version_set: false,
 			key_set: false,
 			headers: Headers::new(),
+			bind_to: None,
 		}
 	}
 
@@ -212,6 +216,16 @@ impl<'u> ClientBuilder<'u> {
 			Some(protos) => protos.0.push(protocol.into()),
 			None => WebSocketProtocol(vec![protocol.into()])
 		});
+		self
+	}
+
+	///
+	/// Bind TCP to the provided `SocketAddr` locally
+	///
+	pub fn binded_to(mut self, local_addr: SocketAddr) -> Self
+	{
+		self.bind_to = Some(local_addr);
+
 		self
 	}
 
@@ -587,6 +601,7 @@ impl<'u> ClientBuilder<'u> {
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			bind_to: None,
 			resolver: resolver.clone(),
 		};
 
@@ -678,6 +693,7 @@ impl<'u> ClientBuilder<'u> {
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			bind_to: None,
 			resolver,
 		};
 
@@ -736,6 +752,7 @@ impl<'u> ClientBuilder<'u> {
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			bind_to: None,
 			resolver
 		};
 
@@ -802,6 +819,7 @@ impl<'u> ClientBuilder<'u> {
 			headers: self.headers,
 			version_set: self.version_set,
 			key_set: self.key_set,
+			bind_to: None,
 			resolver,
 		};
 		let resource = builder.build_request();
@@ -837,11 +855,25 @@ impl<'u> ClientBuilder<'u> {
 	}
 
 	#[cfg(feature = "async")]
+	fn bind_tcp(local_addr: SocketAddr) -> std::io::Result<TcpStream> {
+		let tcp = match local_addr {
+			SocketAddr::V4(_) => TcpBuilder::new_v4(),
+			SocketAddr::V6(_) => TcpBuilder::new_v6(),
+		}?;
+
+		let tcp_stream = tcp.bind(local_addr)?.to_tcp_stream()?;
+
+		Ok(tcp_stream)
+	}
+
+	#[cfg(feature = "async")]
 	fn async_tcpstream(
 		&self,
 		secure: Option<bool>,
 	) -> impl future::Future<Item = TcpStreamNew, Error = WebSocketError> + Send {
 		let resolver = self.resolver.clone();
+
+		let bind_to = self.bind_to;
 
 		self
 			.extract_host_port(secure)
@@ -877,7 +909,23 @@ impl<'u> ClientBuilder<'u> {
 
 				resolve
 					.and_then(move |address| {
-						TcpStreamNew::connect(&SocketAddr::new(address, port)).map_err(Into::into)
+						use futures::future::Either;
+
+						let connect_to = SocketAddr::new(address, port);
+
+						match bind_to {
+							Some(local_addr) => {
+								Either::A(
+									Self::bind_tcp(local_addr)
+										.into_future()
+										.and_then(move |tcp_stream| {
+											TcpStreamNew::connect_std(tcp_stream, &connect_to, &Default::default())
+										}))
+							},
+							None => {
+								Either::B(TcpStreamNew::connect(&connect_to))
+							},
+						}.map_err(Into::into)
 					})
 			})
 	}
@@ -1005,6 +1053,7 @@ impl<'u> ClientBuilder<'u> {
 
 	#[cfg(feature = "sync")]
 	fn establish_tcp(&mut self, secure: Option<bool>) -> WebSocketResult<TcpStream> {
+		//TODO: handle bind_to on sync
 		Ok(TcpStream::connect(self.extract_host_port(secure)?)?)
 	}
 
